@@ -1,0 +1,246 @@
+#version 430 core
+layout(local_size_x = 256) in;
+
+// ── Particle buffer ────────────────────────────────────────────────────────────
+// pos.xy + vel.xy + density + _pad  =  6 floats = 24 bytes
+struct Particle {
+    vec2  pos;
+    vec2  vel;
+    float density;
+    float _pad;
+};
+layout(std430, binding = 0) buffer Particles {
+    Particle particles[];
+};
+
+// ── Gravity objects SSBO (binding = 1) ────────────────────────────────────────
+struct GravObj {
+    vec2  pos;
+    float type;
+    float radius;
+    float force;
+    float _pad;
+    vec2  vel;
+};
+layout(std430, binding = 1) buffer GravityObjects {
+    GravObj gravObjs[];
+};
+
+// ── Image target positions SSBO (binding = 2) ─────────────────────────────────
+layout(std430, binding = 2) buffer Targets {
+    vec2 targetPositions[];
+};
+
+// ── Uniforms ───────────────────────────────────────────────────────────────────
+uniform float dt;
+uniform float zOffset;
+uniform float noiseScale;
+uniform float fieldStrength;
+uniform float maxSpeed;
+uniform float damping;
+uniform vec2  screenSize;
+uniform vec2  mousePos;
+uniform float mouseRadius;
+uniform float mouseForce;
+uniform int   mouseMode;
+uniform int   particleCount;
+uniform float particleMass;
+uniform int   collisionEnabled;
+uniform float collisionRadius;
+uniform float densityRadius;
+
+// Gravity objects
+uniform int   gravObjCount;
+uniform int   gravMode;
+uniform float gravSoftening;
+uniform float gravG;
+
+// Particle-particle gravity
+uniform int   particleGravEnabled;
+uniform float particleGravG;
+uniform float particleGravSoftening;
+
+// ── Image targeting ────────────────────────────────────────────────────────────
+uniform float targetStrength;  // 0 = free flow, 1 = fully snapped to image
+uniform int   targetCount;     // must be >= particleCount when active
+uniform float targetDamping;   // extra velocity damping when targeting
+
+// ── Audio reactivity ───────────────────────────────────────────────────────────
+uniform float audioFieldMult;  // pre-computed on CPU: 1 + beat*k etc.
+uniform float audioSpeedMult;
+uniform float beatKick;        // direct velocity impulse magnitude on beat
+
+// ── Shared memory ─────────────────────────────────────────────────────────────
+shared vec2 groupPos[256];
+
+// ── 3D gradient noise (Perlin-style) ──────────────────────────────────────────
+vec3 hash3(vec3 p) {
+    p = vec3(
+        dot(p, vec3(127.1, 311.7,  74.7)),
+        dot(p, vec3(269.5, 183.3, 246.1)),
+        dot(p, vec3(113.5, 271.9, 124.6))
+    );
+    return -1.0 + 2.0 * fract(sin(p) * 43758.5453123);
+}
+
+float noise3(vec3 p) {
+    vec3 i = floor(p);
+    vec3 f = fract(p);
+    vec3 u = f * f * f * (f * (f * 6.0 - 15.0) + 10.0);
+    return mix(
+        mix(
+            mix(dot(hash3(i+vec3(0,0,0)), f-vec3(0,0,0)),
+                dot(hash3(i+vec3(1,0,0)), f-vec3(1,0,0)), u.x),
+            mix(dot(hash3(i+vec3(0,1,0)), f-vec3(0,1,0)),
+                dot(hash3(i+vec3(1,1,0)), f-vec3(1,1,0)), u.x), u.y),
+        mix(
+            mix(dot(hash3(i+vec3(0,0,1)), f-vec3(0,0,1)),
+                dot(hash3(i+vec3(1,0,1)), f-vec3(1,0,1)), u.x),
+            mix(dot(hash3(i+vec3(0,1,1)), f-vec3(0,1,1)),
+                dot(hash3(i+vec3(1,1,1)), f-vec3(1,1,1)), u.x), u.y),
+        u.z);
+}
+
+vec2 curlNoise(vec3 p) {
+    const float eps = 0.08;
+    float dndy = noise3(p + vec3(0, eps, 0)) - noise3(p - vec3(0, eps, 0));
+    float dndx = noise3(p + vec3(eps, 0, 0)) - noise3(p - vec3(eps, 0, 0));
+    return vec2(dndy, -dndx) / (2.0 * eps);
+}
+
+// ── Main ───────────────────────────────────────────────────────────────────────
+void main() {
+    uint id = gl_GlobalInvocationID.x;
+    if (id >= uint(particleCount)) return;
+
+    Particle p = particles[id];
+
+    // ── Beat kick — random impulse per particle ────────────────────────────────
+    if (beatKick > 0.0) {
+        float seed  = fract(sin(float(id) * 127.1 + 311.7) * 43758.5453);
+        float angle = seed * 6.28318530718;
+        p.vel += vec2(cos(angle), sin(angle)) * beatKick;
+    }
+
+    // ── Flow field ─────────────────────────────────────────────────────────────
+    vec3 noisePos = vec3(p.pos * noiseScale, zOffset);
+    vec2 flow     = curlNoise(noisePos);
+    float effField = fieldStrength * audioFieldMult;
+    p.vel += flow * effField * dt * 60.0;
+
+    // ── Mouse ──────────────────────────────────────────────────────────────────
+    if (mouseForce > 0.0) {
+        vec2  toMouse = mousePos - p.pos;
+        float dist    = length(toMouse);
+        if (dist < mouseRadius && dist > 1.0) {
+            float strength = (1.0 - dist/mouseRadius) * mouseForce * dt * 60.0;
+            vec2  dir      = toMouse / dist;
+            if      (mouseMode == 0) p.vel += dir * strength;
+            else if (mouseMode == 1) p.vel -= dir * strength;
+            else                     p.vel += vec2(-dir.y, dir.x) * strength;
+        }
+    }
+
+    // ── Shared memory ─────────────────────────────────────────────────────────
+    groupPos[gl_LocalInvocationIndex] = p.pos;
+    barrier();
+    memoryBarrierShared();
+
+    // ── Density ────────────────────────────────────────────────────────────────
+    {
+        int cnt = 0;
+        for (int k = 0; k < 256; k++) {
+            if (k == int(gl_LocalInvocationIndex)) continue;
+            if (length(p.pos - groupPos[k]) < densityRadius) cnt++;
+        }
+        p.density = float(cnt) / 255.0;
+    }
+
+    // ── Particle mass (cohesion / separation) ──────────────────────────────────
+    if (abs(particleMass) > 0.001) {
+        vec2 centre = vec2(0.0);
+        for (int k = 0; k < 256; k++) centre += groupPos[k];
+        centre /= 256.0;
+        vec2 toCenter = centre - p.pos;
+        float dist = length(toCenter);
+        if (dist > 1.0)
+            p.vel += (toCenter/dist) * particleMass * dt * 60.0 * 0.15;
+    }
+
+    // ── Particle-particle gravity ──────────────────────────────────────────────
+    if (particleGravEnabled != 0) {
+        vec2 gravAcc = vec2(0.0);
+        for (int k = 0; k < 256; k++) {
+            if (k == int(gl_LocalInvocationIndex)) continue;
+            vec2  diff = groupPos[k] - p.pos;
+            float d2   = dot(diff,diff) + particleGravSoftening*particleGravSoftening;
+            float d    = sqrt(d2);
+            gravAcc += (diff/d) * (particleGravG/d2);
+        }
+        p.vel += gravAcc * dt * 60.0;
+    }
+
+    // ── Collision ─────────────────────────────────────────────────────────────
+    if (collisionEnabled != 0) {
+        vec2 push = vec2(0.0);
+        for (int k = 0; k < 256; k++) {
+            if (k == int(gl_LocalInvocationIndex)) continue;
+            vec2  diff = p.pos - groupPos[k];
+            float dist = length(diff);
+            if (dist < collisionRadius && dist > 0.5) {
+                float overlap = (collisionRadius - dist) / collisionRadius;
+                push += (diff/dist) * overlap;
+            }
+        }
+        p.vel += push * 0.12 * dt * 60.0;
+    }
+
+    // ── Gravity objects ────────────────────────────────────────────────────────
+    for (int i = 0; i < gravObjCount; i++) {
+        vec2  toObj = gravObjs[i].pos - p.pos;
+        float dist  = length(toObj);
+        if (dist < 1.0) continue;
+        vec2  dir = toObj / dist;
+        float strength;
+        if (gravMode == 0) {
+            float radius = gravObjs[i].radius;
+            if (dist >= radius) continue;
+            float nd = dist/radius;
+            strength = gravObjs[i].force * (1.0-nd) / max(nd, 0.05) * dt * 60.0 * 0.05;
+        } else {
+            float d2 = dist*dist + gravSoftening*gravSoftening;
+            strength = gravG * gravObjs[i].force / d2 * dt * 60.0;
+        }
+        if (gravObjs[i].type < 0.5) p.vel += dir * strength;
+        else                         p.vel -= dir * strength;
+    }
+
+    // ── Image target spring ────────────────────────────────────────────────────
+    // Each particle is assigned target[id % targetCount].
+    // Particles stream smoothly into the image shape as targetStrength rises.
+    if (targetStrength > 0.0 && targetCount > 0) {
+        int  tid      = int(id) % targetCount;
+        vec2 toTarget = targetPositions[tid] - p.pos;
+        float dist    = length(toTarget);
+        if (dist > 0.5) {
+            // Progressive pull: gentle at range, stronger when close
+            float pull = min(dist * 0.08, 4.0) * targetStrength;
+            p.vel += (toTarget / dist) * pull * dt * 60.0;
+        }
+        // Blend in extra damping so particles settle rather than orbit
+        p.vel *= mix(1.0, targetDamping, targetStrength);
+    }
+
+    // ── Damping + speed cap ────────────────────────────────────────────────────
+    float effMaxSpeed = maxSpeed * audioSpeedMult;
+    p.vel *= damping;
+    float speed = length(p.vel);
+    if (speed > effMaxSpeed)
+        p.vel = (p.vel / speed) * effMaxSpeed;
+
+    // ── Integrate + wrap ───────────────────────────────────────────────────────
+    p.pos += p.vel * dt * 60.0;
+    p.pos  = mod(p.pos + screenSize, screenSize);
+
+    particles[id] = p;
+}

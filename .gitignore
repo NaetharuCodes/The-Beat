@@ -1,0 +1,30 @@
+# Build output
+build/
+out/
+
+# CMake
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+install_manifest.txt
+compile_commands.json
+CTestTestfile.cmake
+_deps/
+
+# Visual Studio
+.vs/
+*.user
+*.suo
+*.VC.db
+*.VC.opendb
+
+# Binaries
+*.exe
+*.dll
+*.pdb
+*.ilk
+*.exp
+*.lib
+
+# ImGui
+imgui.ini
