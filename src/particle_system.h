@@ -49,6 +49,12 @@ struct Params {
     float reactMidColor   = 1.2f;   // mid energy → hue shift speed
     float reactHighEvol   = 0.8f;   // high energy → evolution speed
 
+    // Swarm / Boids
+    float swarmSeparation = 0.0f;   // repulsion between close particles
+    float swarmAlignment  = 0.0f;   // velocity matching with neighbours
+    float swarmCohesion   = 0.0f;   // pull toward group centre
+    float swarmRadius     = 60.0f;  // neighbourhood radius in screen pixels
+
     // Gravity objects
     bool  objectsDrift      = true;
     bool  gravityMode       = false;
@@ -141,9 +147,13 @@ public:
         computeShader.setFloat("targetStrength", params.targetStrength);
         computeShader.setInt  ("targetCount",    activeTargetCount);
         computeShader.setFloat("targetDamping",  params.targetDamping);
-        computeShader.setFloat("audioFieldMult", audioFieldMult);
-        computeShader.setFloat("audioSpeedMult", audioSpeedMult);
-        computeShader.setFloat("beatKick",       audioBeatKick);
+        computeShader.setFloat("audioFieldMult",  audioFieldMult);
+        computeShader.setFloat("audioSpeedMult",  audioSpeedMult);
+        computeShader.setFloat("beatKick",        audioBeatKick);
+        computeShader.setFloat("swarmSeparation", params.swarmSeparation);
+        computeShader.setFloat("swarmAlignment",  params.swarmAlignment);
+        computeShader.setFloat("swarmCohesion",   params.swarmCohesion);
+        computeShader.setFloat("swarmRadius",     params.swarmRadius);
 
         glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 0, ssbo);
         glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 1, gravSSBO);

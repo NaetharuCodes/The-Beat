@@ -70,8 +70,15 @@ uniform float audioFieldMult;  // pre-computed on CPU: 1 + beat*k etc.
 uniform float audioSpeedMult;
 uniform float beatKick;        // direct velocity impulse magnitude on beat
 
+// ── Swarm / Boids ──────────────────────────────────────────────────────────────
+uniform float swarmSeparation; // repulsion strength within inner radius
+uniform float swarmAlignment;  // velocity-matching strength
+uniform float swarmCohesion;   // center-pull strength
+uniform float swarmRadius;     // neighbourhood radius (px); inner sep = radius*0.5
+
 // ── Shared memory ─────────────────────────────────────────────────────────────
 shared vec2 groupPos[256];
+shared vec2 groupVel[256];
 
 // ── 3D gradient noise (Perlin-style) ──────────────────────────────────────────
 vec3 hash3(vec3 p) {
@@ -143,6 +150,7 @@ void main() {
 
     // ── Shared memory ─────────────────────────────────────────────────────────
     groupPos[gl_LocalInvocationIndex] = p.pos;
+    groupVel[gl_LocalInvocationIndex] = p.vel;
     barrier();
     memoryBarrierShared();
 
@@ -213,6 +221,47 @@ void main() {
         }
         if (gravObjs[i].type < 0.5) p.vel += dir * strength;
         else                         p.vel -= dir * strength;
+    }
+
+    // ── Swarm / Boids forces ──────────────────────────────────────────────────
+    // Operates over the 256-particle workgroup (shared memory already filled).
+    // Separation: repel neighbours within inner radius (swarmRadius * 0.5).
+    // Alignment:  match average heading of neighbours within full radius.
+    // Cohesion:   pull toward group centroid within full radius.
+    if (swarmSeparation > 0.0 || swarmAlignment > 0.0 || swarmCohesion > 0.0) {
+        float sepR  = swarmRadius * 0.5;
+        vec2  sep   = vec2(0.0);
+        vec2  align = vec2(0.0);
+        vec2  ctr   = vec2(0.0);
+        int   cnt   = 0;
+
+        for (int k = 0; k < 256; k++) {
+            if (k == int(gl_LocalInvocationIndex)) continue;
+            vec2  diff = p.pos - groupPos[k];
+            float d    = length(diff);
+
+            if (d < sepR && d > 0.5)
+                sep += (diff / d) * (1.0 - d / sepR);  // linear falloff
+
+            if (d < swarmRadius && d > 0.5) {
+                align += groupVel[k];
+                ctr   += groupPos[k];
+                cnt++;
+            }
+        }
+
+        // Separation: push outward (scaled so strength=1 is noticeable)
+        p.vel += sep * swarmSeparation * dt * 60.0 * 0.15;
+
+        if (cnt > 0) {
+            // Alignment: steer velocity toward neighbour average
+            vec2 avgVel = align / float(cnt);
+            p.vel += (avgVel - p.vel) * swarmAlignment * 0.06;
+
+            // Cohesion: drift toward group centroid
+            vec2 avgPos = ctr / float(cnt);
+            p.vel += (avgPos - p.pos) * swarmCohesion * dt * 60.0 * 0.0004;
+        }
     }
 
     // ── Image target spring ────────────────────────────────────────────────────

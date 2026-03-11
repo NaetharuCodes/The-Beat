@@ -15,6 +15,8 @@
 #include "audio_engine.h"
 #include "image_target.h"
 #include "sequencer.h"
+#include "shape_target.h"
+#include "preset.h"
 
 // ── Globals ────────────────────────────────────────────────────────────────────
 static ParticleSystem ps;
@@ -32,6 +34,13 @@ static bool   leftDown = false;
 // Image blend state
 static bool  imageBlendingIn  = false;
 static bool  imageBlendingOut = false;
+
+// Shape placement state
+static ShapeType shapeType    = ShapeType::Star5;
+static float     shapeRadius  = 250.0f;
+static float     shapeRotDeg  = 0.0f;
+static bool      placingShape = false;
+static bool      prevLMB      = false;
 
 // Hue accumulator driven by mid energy reactivity
 static float hueAccum   = 0.0f;
@@ -158,11 +167,92 @@ static void loadTextAndTargets(const std::string& text, int fontSize) {
     }
 }
 
+static void loadShapeAndTargets(ShapeType type, float cx, float cy,
+                                float radius, float rotDeg) {
+    if (ps.params.targetStrength > 0.0f) {
+        imageBlendingOut = true;
+        imageBlendingIn  = false;
+    }
+    auto positions = generateShapeTargets(
+        type, cx, cy, radius, rotDeg * (float)(M_PI / 180.0), ps.params.count);
+    std::string name = std::string(kShapeNames[(int)type]);
+    if (imageTarget.loadFromShape(positions, name)) {
+        ps.setTargetSSBO(imageTarget.ssbo, imageTarget.targetCount);
+        imageBlendingIn  = true;
+        imageBlendingOut = false;
+    }
+}
+
 static void releaseImage() {
     if (ps.params.targetStrength > 0.0f || imageTarget.isLoaded()) {
         imageBlendingOut = true;
         imageBlendingIn  = false;
     }
+}
+
+// ── Preset helpers ─────────────────────────────────────────────────────────────
+static std::string currentPresetPath;   // empty = unsaved
+
+static std::string openSaveDialog(const char* title, const char* filter,
+                                  const char* defaultExt) {
+    char buf[MAX_PATH] = {};
+    OPENFILENAMEA ofn  = {};
+    ofn.lStructSize    = sizeof(ofn);
+    ofn.lpstrFilter    = filter;
+    ofn.lpstrFile      = buf;
+    ofn.nMaxFile       = MAX_PATH;
+    ofn.lpstrTitle     = title;
+    ofn.lpstrDefExt    = defaultExt;
+    ofn.Flags          = OFN_OVERWRITEPROMPT | OFN_PATHMUSTEXIST;
+    return GetSaveFileNameA(&ofn) ? buf : "";
+}
+
+static void savePreset(const std::string& path) {
+    PresetData d;
+    d.params      = ps.params;
+    d.params.pointSize = basePointSize;   // save the base size, not the modulated one
+    d.shapeType   = (int)shapeType;
+    d.shapeRadius = shapeRadius;
+    d.shapeRotDeg = shapeRotDeg;
+    d.audioFile   = audio.getFilename();
+    d.events      = sequencer.events;
+    if (d.save(path))
+        std::cout << "[Preset] Saved: " << path << "\n";
+    else
+        std::cerr << "[Preset] Save failed: " << path << "\n";
+}
+
+static void loadPreset(const std::string& path) {
+    PresetData d;
+    d.params = ps.params;   // seed with current values as defaults
+    if (!d.load(path)) { std::cerr << "[Preset] Load failed: " << path << "\n"; return; }
+
+    // Apply particle params (resize if count changed)
+    int oldCount = ps.params.count;
+    ps.params = d.params;
+    if (d.params.count != oldCount)
+        ps.setCount(d.params.count);
+    ps.clearTrail();
+
+    // Sync base point size
+    basePointSize = d.params.pointSize;
+
+    // Rebuild sequencer
+    sequencer.clear();
+    sequencer.events = d.events;
+    sequencer.sortEvents();
+    sequencer.resetTriggers();
+
+    // Restore shape UI state
+    shapeType   = (ShapeType)d.shapeType;
+    shapeRadius = d.shapeRadius;
+    shapeRotDeg = d.shapeRotDeg;
+
+    currentPresetPath = path;
+    std::cout << "[Preset] Loaded: " << path
+              << "  (" << d.events.size() << " events)\n";
+    if (!d.audioFile.empty())
+        std::cout << "[Preset] Audio file in preset: " << d.audioFile << "\n";
 }
 
 // ── Control panel ──────────────────────────────────────────────────────────────
@@ -197,9 +287,8 @@ static void drawPanel(ImGuiIO& io, const AudioAnalysis& an) {
     ImGui::SetNextWindowPos (ImVec2(panelX, 0), ImGuiCond_Always);
     ImGui::SetNextWindowSize(ImVec2(W, (float)windowH), ImGuiCond_Always);
     ImGui::Begin("##panel", nullptr,
-        ImGuiWindowFlags_NoTitleBar  | ImGuiWindowFlags_NoResize  |
-        ImGuiWindowFlags_NoMove      | ImGuiWindowFlags_NoBringToFrontOnFocus |
-        ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse);
+        ImGuiWindowFlags_NoTitleBar  | ImGuiWindowFlags_NoResize |
+        ImGuiWindowFlags_NoMove      | ImGuiWindowFlags_NoBringToFrontOnFocus);
 
     // ── Title ─────────────────────────────────────────────────────────────────
     ImGui::SetCursorPosY(ImGui::GetCursorPosY() + 4);
@@ -210,6 +299,47 @@ static void drawPanel(ImGuiIO& io, const AudioAnalysis& an) {
     ImGui::Spacing();
 
     float bw = (W - 36.0f) * 0.5f - 4.0f;
+
+    // ── PRESET ────────────────────────────────────────────────────────────────
+    if (ImGui::CollapsingHeader("Preset")) {
+        ImGui::Spacing();
+
+        if (currentPresetPath.empty())
+            ImGui::TextDisabled("Unsaved");
+        else {
+            // Show just the filename, not the full path
+            size_t sep = currentPresetPath.find_last_of("/\\");
+            std::string name = (sep == std::string::npos)
+                               ? currentPresetPath : currentPresetPath.substr(sep+1);
+            ImGui::TextColored(ImVec4(0.5f,1.0f,0.6f,1.0f), "%s", name.c_str());
+        }
+
+        ImGui::Spacing();
+
+        if (ImGui::Button("Save Preset...", ImVec2(-1, 0))) {
+            auto p = openSaveDialog("Save Preset",
+                "The Beat Preset\0*.tbpreset\0All Files\0*.*\0", "tbpreset");
+            if (!p.empty()) { savePreset(p); currentPresetPath = p; }
+        }
+
+        // Quick save if already saved once
+        if (!currentPresetPath.empty()) {
+            if (ImGui::Button("Save  (overwrite)", ImVec2(-1, 0)))
+                savePreset(currentPresetPath);
+        }
+
+        if (ImGui::Button("Load Preset...", ImVec2(-1, 0))) {
+            auto p = openFileDialog("Load Preset",
+                "The Beat Preset\0*.tbpreset\0All Files\0*.*\0");
+            if (!p.empty()) { loadPreset(p); currentPresetPath = p; }
+        }
+
+        ImGui::Spacing();
+        ImGui::TextDisabled("Saves: all particle, rendering,");
+        ImGui::TextDisabled("reactivity, swarm & sequencer settings.");
+        ImGui::TextDisabled("Audio file path is noted but not re-loaded.");
+        ImGui::Spacing();
+    }
 
     // ── AUDIO ─────────────────────────────────────────────────────────────────
     if (ImGui::CollapsingHeader("Audio", ImGuiTreeNodeFlags_DefaultOpen)) {
@@ -346,6 +476,31 @@ static void drawPanel(ImGuiIO& io, const AudioAnalysis& an) {
         ImGui::Spacing();
     }
 
+    // ── SWARM / BOIDS ─────────────────────────────────────────────────────────
+    if (ImGui::CollapsingHeader("Swarm / Boids")) {
+        ImGui::Spacing();
+        ImGui::TextDisabled("All off by default — blend in gradually.");
+        ImGui::Spacing();
+
+        ImGui::TextDisabled("Neighbourhood Radius (px)");
+        ImGui::SetNextItemWidth(-1);
+        ImGui::SliderFloat("##swr", &ps.params.swarmRadius, 10.0f, 300.0f, "%.0f px");
+
+        ImGui::TextDisabled("Separation  (push apart)");
+        ImGui::SetNextItemWidth(-1);
+        ImGui::SliderFloat("##sws", &ps.params.swarmSeparation, 0.0f, 5.0f, "%.2f");
+
+        ImGui::TextDisabled("Alignment  (match heading)");
+        ImGui::SetNextItemWidth(-1);
+        ImGui::SliderFloat("##swa", &ps.params.swarmAlignment, 0.0f, 5.0f, "%.2f");
+
+        ImGui::TextDisabled("Cohesion  (flock together)");
+        ImGui::SetNextItemWidth(-1);
+        ImGui::SliderFloat("##swc", &ps.params.swarmCohesion, 0.0f, 5.0f, "%.2f");
+
+        ImGui::Spacing();
+    }
+
     // ── RENDERING ─────────────────────────────────────────────────────────────
     if (ImGui::CollapsingHeader("Rendering")) {
         ImGui::Spacing();
@@ -415,6 +570,54 @@ static void drawPanel(ImGuiIO& io, const AudioAnalysis& an) {
         ImGui::TextDisabled("Target Damping  (settling speed)");
         ImGui::SetNextItemWidth(-1);
         ImGui::SliderFloat("##td", &ps.params.targetDamping, 0.80f, 0.99f, "%.3f");
+
+        ImGui::Spacing();
+    }
+
+    // ── SHAPES ────────────────────────────────────────────────────────────────
+    if (ImGui::CollapsingHeader("Shapes")) {
+        ImGui::Spacing();
+
+        ImGui::TextDisabled("Shape");
+        ImGui::SetNextItemWidth(-1);
+        if (ImGui::BeginCombo("##shtype", kShapeNames[(int)shapeType])) {
+            for (int i = 0; i < (int)ShapeType::COUNT; i++) {
+                bool sel = (i == (int)shapeType);
+                if (ImGui::Selectable(kShapeNames[i], sel))
+                    shapeType = (ShapeType)i;
+                if (sel) ImGui::SetItemDefaultFocus();
+            }
+            ImGui::EndCombo();
+        }
+
+        ImGui::TextDisabled("Radius (px)");
+        ImGui::SetNextItemWidth(-1);
+        ImGui::SliderFloat("##shrad", &shapeRadius, 20.0f, 900.0f, "%.0f");
+
+        ImGui::TextDisabled("Rotation (degrees)");
+        ImGui::SetNextItemWidth(-1);
+        ImGui::SliderFloat("##shrot", &shapeRotDeg, 0.0f, 360.0f, "%.1f");
+
+        ImGui::Spacing();
+
+        if (placingShape) {
+            ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.7f,0.2f,0.2f,1.0f));
+            if (ImGui::Button("Cancel placement", ImVec2(-1, 0)))
+                placingShape = false;
+            ImGui::PopStyleColor();
+            ImGui::TextDisabled("Click anywhere on the canvas to place.");
+        } else {
+            if (ImGui::Button("Place with mouse", ImVec2(-1, 0)))
+                placingShape = true;
+            if (ImGui::Button("Place at screen centre", ImVec2(-1, 0)))
+                loadShapeAndTargets(shapeType,
+                                    windowW * 0.5f, windowH * 0.5f,
+                                    shapeRadius, shapeRotDeg);
+        }
+
+        ImGui::Spacing();
+        if (ImGui::Button("Clear / release", ImVec2(-1, 0)))
+            releaseImage();
 
         ImGui::Spacing();
     }
@@ -643,6 +846,15 @@ int main() {
 
         glfwGetCursorPos(win, &mouseX, &mouseY);
         ps.params.mouseActive = leftDown && !io.WantCaptureMouse;
+
+        // ── Shape placement — detect click on canvas ───────────────────────────
+        bool canvasClick = leftDown && !prevLMB && !io.WantCaptureMouse;
+        prevLMB = leftDown;
+        if (placingShape && canvasClick) {
+            loadShapeAndTargets(shapeType, (float)mouseX, (float)mouseY,
+                                shapeRadius, shapeRotDeg);
+            placingShape = false;
+        }
 
         // ── Audio analysis ────────────────────────────────────────────────────
         AudioAnalysis an = audio.update(dt);

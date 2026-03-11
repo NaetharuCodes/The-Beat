@@ -165,6 +165,23 @@ public:
         return ok;
     }
 
+    // ── Upload pre-computed positions (procedural shapes) ─────────────────────
+    // positions: interleaved [x0,y0, x1,y1, ...]; targetCount = size()/2
+    bool loadFromShape(const std::vector<float>& positions, const std::string& name) {
+        unload();
+        if (positions.empty()) return false;
+        glGenBuffers(1, &ssbo);
+        glBindBuffer(GL_SHADER_STORAGE_BUFFER, ssbo);
+        glBufferData(GL_SHADER_STORAGE_BUFFER,
+                     (GLsizeiptr)(positions.size() * sizeof(float)),
+                     positions.data(), GL_STATIC_DRAW);
+        glBindBuffer(GL_SHADER_STORAGE_BUFFER, 0);
+        targetCount = (int)(positions.size() / 2);
+        displayName = name;
+        std::cout << "[Shape] " << name << "  targets=" << targetCount << "\n";
+        return true;
+    }
+
     // ── Bind SSBO to slot 2 for the compute shader ────────────────────────────
     void bind() const {
         if (ssbo) glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 2, ssbo);

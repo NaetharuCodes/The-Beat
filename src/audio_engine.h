@@ -175,6 +175,7 @@ public:
         return (float)m_framesRead.load() / std::max(1u, m_sampleRate);
     }
     const std::string& getDisplayName() const { return m_displayName; }
+    const std::string& getFilename()    const { return m_filename; }
 
     void setVolume(float v) { m_volume.store(std::clamp(v, 0.0f, 1.0f)); }
     float getVolume()  const { return m_volume.load(); }
